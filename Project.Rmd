@@ -1,0 +1,674 @@
+---
+title: "Project"
+author: "Team"
+date: "2025-12-07"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(results = 'hold')
+knitr::opts_chunk$set(fig.show = 'hold')
+library(readr)
+library(dplyr)
+library(mgcv)
+library(pROC)
+library(tidyr)
+library(ggplot2)
+library(logistf)
+library(performance)
+library(visreg)
+set.seed(42)
+```
+
+## Data
+
+```{r}
+df <- read.csv("new_dataset.csv") 
+df[is.na(df)] <- 0
+
+factor_vars <- c(
+  "mcc",
+  "gender",
+  "merchant_id",
+  "state_abbr",
+  "card_brand",
+  "card_type",
+  "month",
+  "time_of_day"
+)
+for (v in intersect(factor_vars, names(df))) {
+  df[[v]] <- factor(df[[v]])
+}
+
+df <- df |>
+  filter(amount > 0) |>
+  mutate(
+    season = case_when(
+      month %in% c("12", "1", "2")  ~ "Winter",
+      month %in% c("3",  "4", "5")  ~ "Spring",
+      month %in% c("6",  "7", "8")  ~ "Summer",
+      month %in% c("9", "10", "11") ~ "Fall",
+      TRUE ~ NA_character_
+    ),
+    season = factor(season)
+  ) |>
+  mutate(
+    log_amount = log(amount + 1),
+    log_income = log(yearly_income + 1),
+    log_time_since = log(time_since_last_txn + 1),
+    log_total_debt = log(total_debt + 1),
+    log_credit_limit = log(credit_limit + 1)
+  )
+  
+df$season <- relevel(df$season, ref = "Summer")
+```
+
+```{r}
+con <- c("amount", "current_age", "time_since_last_txn",
+         "yearly_income", "credit_limit", "pin_age_years", "total_debt",
+         "credit_score", "num_cards_issued", "account_age_years", 
+         "num_credit_cards", "is_fraud")
+df_long <- df[, con] |>
+  pivot_longer(names_to = "variable", values_to ="value", cols = -"is_fraud")
+df_binned <- df_long %>%
+  group_by(variable) %>%
+  mutate(bin = ntile(value, 10)) %>% 
+  group_by(variable, bin) %>%
+  summarise(
+    mean_x = mean(value, na.rm = TRUE),      
+    prob_fraud = mean(is_fraud, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+ggplot(df_binned, aes(x = mean_x, y = prob_fraud)) +
+  geom_point() +
+  geom_line() +
+  facet_wrap(~variable, scales = "free_x") +
+  labs(y = "Fraud Rate (Probability)", x = "Mean of Variable (Binned)",
+       title = "Binned Analysis: Checking for Linearity") +
+  theme_bw()
+```
+
+## GLM Model
+
+### Fit Model
+
+```{r}
+df$card_brand <- relevel(df$card_brand, ref = "Discover")
+mod_GLM <- glm(
+  is_fraud ~
+    log_amount +
+    log_time_since +
+    log_income +
+    log_total_debt +
+    credit_score +
+    num_credit_cards +
+    num_cards_issued +
+    log_credit_limit +
+    season +
+    current_age +
+    account_age_years +
+    pin_age_years +
+    gender +
+    card_brand +
+    card_type +
+    time_of_day,
+  data    = df,
+  family  = binomial()
+)
+
+summary(mod_GLM)
+```
+
+### Figure 2 in Section 5.1
+
+```{r, warning = FALSE, fig.width=6, fig.height=7}
+coef_df <- as.data.frame(summary(mod_GLM)$coefficients)
+coef_df$Term <- rownames(coef_df)
+
+inference_df <- coef_df %>%
+  filter(Term != "(Intercept)") %>%
+  mutate(
+    OR = exp(Estimate),
+    Lower_CI = exp(Estimate - 1.96 * `Std. Error`),
+    Upper_CI = exp(Estimate + 1.96 * `Std. Error`),
+    Significance = ifelse(`Pr(>|z|)` < 0.05, "Significant", "Not Significant")
+  ) %>%
+  arrange(desc(OR))
+
+ggplot(inference_df, 
+       aes(x = OR, y = reorder(Term, OR), color = Significance)) +
+  geom_point(size = 3) +
+  geom_errorbarh(aes(xmin = Lower_CI, xmax = Upper_CI), height = 0.2) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "gray40") +
+  scale_x_continuous(
+    breaks = seq(-1, 2.5, by = 1), 
+    limits = c(-1, 2.5)
+  ) +
+  scale_color_manual(values = c("Significant" = "red", 
+                                "Not Significant" = "black")) +
+  labs(
+    title = "Forest Plot of Fraud Risk Factors (Odds Ratios)",
+    subtitle = "OR>1 indicates higher fraud risk; OR<1 indicates lower risk",
+    x = "Odds Ratio (log scale)",
+    y = "Predictors"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+## GAM Model
+
+```{r}
+df$card_brand <- relevel(df$card_brand, ref = "Amex")
+mod_GAM <- bam(
+  is_fraud ~ 
+    credit_score +
+    num_credit_cards +
+    num_cards_issued +
+    current_age +
+    account_age_years +
+    pin_age_years +
+    gender +
+    card_brand + 
+    card_type + 
+    season + 
+    time_of_day +
+    
+    s(log_amount, k = 20) +
+    s(log_income, k = 30) +
+    s(log_total_debt, k = 30) +
+    s(log_time_since, k = 30) +
+    s(log_credit_limit, k = 20),
+  
+  data    = df,
+  family  = binomial(),
+  method  = "fREML",
+  discrete = TRUE
+)
+
+summary(mod_GAM)
+```
+
+## GAMM Model
+
+### Fit Model
+
+```{r, warning = FALSE}
+mod_GAMM <- bam(
+  is_fraud ~
+    credit_score +
+    num_credit_cards +
+    num_cards_issued +
+    current_age +
+    account_age_years +
+    pin_age_years +
+    gender +
+    card_brand +
+    card_type +
+    season +
+    time_of_day +
+
+    s(log_amount,       k = 20) +
+    s(log_income,       k = 40) +
+    s(log_total_debt,   k = 70) +
+    s(log_time_since,   k = 30) +
+    s(log_credit_limit, k = 35) +
+
+    s(merchant_id, bs = "re") +
+    s(mcc,         bs = "re") +
+    s(state_abbr,  bs = "re"),
+
+  data      = df,
+  family    = binomial(),
+  method    = "fREML",
+  discrete  = TRUE,
+  na.action = na.exclude
+)
+
+summary(mod_GAMM)
+```
+
+### Figure 3 & 4 in Section 5.3
+
+```{r}
+visreg(mod_GAMM, "log_amount", scale="linear")
+visreg(mod_GAMM, "log_total_debt", scale="linear")
+```
+
+## Numerical Simulation
+
+### Simulate the data
+
+```{r}
+#Functions for nonlinear scenario
+f1 <- function(x) 2.0 * sin(4 * pi * x)              
+f2 <- function(x) {
+  -4 * (x - 0.25)^2 + 3 * exp(-40 * (x - 0.75)^2)
+}
+
+simulate_data <- function(N =2000, scenario=c("linear", "nonlinear", "nonlinear_RE")){
+    scenario <- match.arg(scenario)
+   
+    x1 <- rnorm(N, 0, 1)
+    x2 <- rnorm(N, 0, 1)
+   
+    # Set up grouping structure for random effects
+    n_group  <- 100
+    group_id <- factor(sample(seq_len(n_group), N, replace = TRUE))
+   
+   
+    if (scenario == "linear") {
+        eta <- -3 + 2 * x1 - 1.5 * x2    
+    } else if (scenario == "nonlinear"){  
+        eta <- -3 + f1(x1) + f2(x2)    
+       
+    } else if (scenario == "nonlinear_RE") {
+   
+        eta_mean <- -3 + f1(x1) + f2(x2)
+       
+        sigma_group <- 2
+        u_group     <- rnorm(n_group, mean = 0, sd = sigma_group)
+       
+        eta <- eta_mean + u_group[group_id]
+   
+    } else {
+        stop("Unknown scenario")
+    }
+   
+    p <- plogis(eta)
+    y <- rbinom(N, size=1, prob=p)
+   
+    data.frame(y=y, x1=x1, x2=x2, p_true=p, group_id = group_id)
+}
+```
+
+### Fit and Score the Models
+
+```{r}
+fit_and_score <- function(df) {
+    n <- nrow(df)
+    id <- sample(seq_len(n), size = floor(0.7 * n))
+    train <- df[id,]
+    test <- df[-id,]
+   
+    mod_glm <- glm(y ~ x1 + x2, data=train, family = binomial())
+   
+    mod_gam <- bam(y ~ s(x1, k=10) + s(x2, k=10), data=train, family=binomial(), method="fREML", discrete = TRUE)
+   
+    mod_gamm <- bam(
+        y ~ s(x1, k = 10) + s(x2, k = 10) + s(group_id, bs = "re"),
+        data   = train,
+        family = binomial(),
+        method = "fREML",
+        discrete = TRUE
+      )
+   
+    glm_pred <- predict(mod_glm, newdata = test, type="response")
+    gam_pred <- predict(mod_gam, newdata = test, type="response")
+    gamm_pred <- predict(mod_gamm, newdata = test, type="response")
+   
+    auc_glm <- as.numeric(roc(test$y, glm_pred)$auc)
+    auc_gam <- as.numeric(roc(test$y, gam_pred)$auc)
+    auc_gamm <- as.numeric(roc(test$y, gamm_pred)$auc)
+   
+    brier_glm <- mean((glm_pred - test$y)^2)
+    brier_gam <- mean((gam_pred - test$y)^2)
+    brier_gamm <- mean((gamm_pred - test$y)^2)
+   
+    data.frame(
+        model = c("GLM", "GAM", "GAMM"),
+        AUC = c(auc_glm, auc_gam, auc_gamm),
+        brier = c(brier_glm, brier_gam, brier_gamm)
+    )
+}
+```
+
+### Run Simulations
+
+```{r, message=FALSE, warning=FALSE}
+run_sims <- function(n_sims = 100, scenario=c("linear", "nonlinear", "nonlinear_RE"), N = 2000){
+    scenario <- match.arg(scenario)
+   
+    bind_rows(
+        replicate(n_sims, {
+            df <- simulate_data(N=N, scenario = scenario)
+            out <- fit_and_score(df)
+            out$scenario <- scenario
+            out
+        }, simplify = FALSE)
+    )
+}
+
+res_linear <- run_sims(n_sims = 100, scenario = "linear", N=2000)
+res_nonlinear <- run_sims(n_sims = 100, scenario = "nonlinear", N=2000)
+res_nonlinear_RE <- run_sims(n_sims = 100, scenario = "nonlinear_RE", N=2000)
+
+all_res <- bind_rows(res_linear, res_nonlinear, res_nonlinear_RE)
+```
+
+### Figure 5 & 6 in Section 6.3
+
+```{r}
+plot_df <- all_res %>%
+  group_by(scenario, model) %>%
+  summarise(
+    mean_AUC   = mean(AUC),
+    sd_AUC     = sd(AUC),
+    mean_Brier = mean(brier),
+    sd_Brier   = sd(brier),
+    .groups = "drop"
+  ) %>%
+  mutate(model = factor(model, levels = c("GLM", "GAM", "GAMM"))) %>%
+  pivot_longer(
+    cols = c(mean_AUC, sd_AUC, mean_Brier, sd_Brier),
+    names_to   = c("stat", "metric"),
+    names_sep  = "_",
+    values_to  = "value"
+  ) %>%
+  pivot_wider(
+    names_from  = "stat",
+    values_from = "value"
+  )
+
+plot_auc <- plot_df %>%
+  filter(metric == "AUC") %>%
+  ggplot(aes(x = model, y = mean, fill = model)) +
+  geom_col(width = 0.7) +
+  geom_errorbar(aes(ymin = mean - sd, ymax = mean + sd), width = 0.15) +
+  facet_wrap(~ scenario) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(
+    x = "Model",
+    y = "Mean AUC",
+    title = "Simulation results: AUC by model and scenario",
+    fill = "Model"
+  ) +
+  theme_bw() +
+  theme(
+    legend.position = "bottom",
+    panel.grid.major.x = element_blank()
+  )
+
+plot_brier <- plot_df %>%
+  filter(metric == "Brier") %>%
+  ggplot(aes(x = model, y = mean, fill = model)) +
+  geom_col(width = 0.7) +
+  geom_errorbar(aes(ymin = mean - sd, ymax = mean + sd), width = 0.15) +
+  facet_wrap(~ scenario) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(
+    x = "Model",
+    y = "Mean Brier score",
+    title = "Simulation results: Brier score by model and scenario",
+    fill = "Model",
+  ) +
+  theme_bw() +
+  theme(
+    legend.position = "bottom",
+    panel.grid.major.x = element_blank()
+  )
+
+plot_auc
+plot_brier
+```
+
+## Slides
+
+Plots used in our slides but not shown in the report can be reproduced by codes below.
+
+### Page 7
+
+```{r}
+con <- c("amount", "current_age", "time_since_last_txn",
+         "yearly_income", "credit_limit", "pin_age_years", "total_debt",
+         "credit_score", "num_cards_issued", "account_age_years", 
+         "num_credit_cards")
+plot_data <- df[, con] |>
+  pivot_longer(cols = everything(), 
+               names_to = "Variable",
+               values_to = "Value")
+
+ggplot(plot_data, aes(x = Value)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "white", alpha = 0.8) +
+  facet_wrap(~ Variable, scales = "free", ncol = 4) +
+  theme_bw() +
+  labs(title = "Distribution of Continuous Variables", y = "Frequency", x = "") +
+  theme(
+    strip.text = element_text(face = "bold", size = 10), 
+    axis.text.x = element_text(angle = 45, hjust = 1)    
+  )
+```
+
+### Page 19
+
+```{r}
+log_vars <- c("log_amount", "log_income", "log_total_debt", 
+              "log_time_since", "log_credit_limit")
+df_long <- df %>%
+  dplyr::select(all_of(log_vars), is_fraud) %>% 
+  pivot_longer(cols = all_of(log_vars), names_to = "variable", values_to = "value")
+df_binned <- df_long %>%
+  group_by(variable) %>%
+  mutate(bin = ntile(value, 10)) %>% 
+  group_by(variable, bin) %>%
+  summarise(
+    mean_x = mean(value, na.rm = TRUE),      
+    prob_fraud = mean(is_fraud, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+ggplot(df_binned, aes(x = mean_x, y = prob_fraud)) +
+  geom_point() +
+  geom_line() +
+  facet_wrap(~variable, scales = "free_x") +
+  labs(y = "Fraud Rate (Probability)", x = "Mean of Variable (Binned)",
+       title = "Binned Analysis: Checking for Linearity") +
+  theme_bw()
+```
+
+### Page 26
+
+```{r}
+n0 <- sum(df$is_fraud == 0, na.rm = TRUE)
+n1 <- sum(df$is_fraud == 1, na.rm = TRUE)
+w <- ifelse(df$is_fraud == 1, n0/n1, 1)
+gam_weight <- bam(
+  is_fraud ~ 
+    credit_score +
+    num_credit_cards +
+    num_cards_issued +
+    current_age +
+    account_age_years +
+    pin_age_years +
+    gender + 
+    card_brand + 
+    card_type + 
+    season + 
+    time_of_day +
+    s(log_amount, k = 20) +
+    s(log_income,       k = 30) +
+    s(log_total_debt,   k = 30) +
+    s(log_credit_limit, k = 30) +
+    s(log_time_since, k = 20),
+  data    = df,
+  family  = binomial(),
+  method  = "fREML",
+  discrete = TRUE,
+  weight = w
+)
+
+df_used <- model.frame(gam_weight)
+df_used$resid <- residuals(gam_weight, type = "pearson")
+keep_rows <- as.numeric(rownames(model.frame(gam_weight)))
+df_clean <- df[keep_rows, ]
+df_clean$resid <- residuals(gam_weight, type = "pearson")
+
+merchant_check <- df_clean %>% 
+  group_by(merchant_id) %>%
+  summarise(mean_resid = mean(resid, na.rm = TRUE),
+            count = n()) %>%
+  filter(count > 10) %>% 
+  arrange(mean_resid)
+
+ggplot(merchant_check, aes(x = reorder(merchant_id, mean_resid), y = mean_resid)) +
+  geom_point(alpha = 0.6, size = 2) + 
+  geom_hline(yintercept = 0, color = "red", linetype = "dashed") +
+  theme_minimal() +
+  theme(axis.text.x = element_blank(), 
+        axis.ticks.x = element_blank()) +
+  labs(title = "Merchant Heterogeneity (Baseline GAM)",
+       subtitle = "S-curve indicates need for Random Intercepts",
+       x = "Merchants (Sorted)", 
+       y = "Mean Pearson Residual")
+
+mcc_check <- df_clean %>% 
+  group_by(mcc) %>%
+  summarise(
+    mean_resid = mean(resid, na.rm = TRUE),
+    count = n()
+  ) %>%
+  filter(count > 10) %>%
+  arrange(mean_resid)
+
+ggplot(mcc_check, aes(x = reorder(mcc, mean_resid), y = mean_resid)) +
+  geom_point(alpha = 0.6, size = 2) +
+  geom_hline(yintercept = 0, color = "red", linetype = "dashed") +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank()
+  ) +
+  labs(
+    title = "MCC Heterogeneity (Baseline GAM)",
+    subtitle = "Large variation suggests need for random intercepts",
+    x = "MCC (Sorted)",
+    y = "Mean Pearson Residual"
+  )
+
+state_check <- df_clean %>% 
+  group_by(state_abbr) %>%
+  summarise(
+    mean_resid = mean(resid, na.rm = TRUE),
+    count = n()
+  ) %>%
+  filter(count > 10) %>%
+  arrange(mean_resid)
+
+ggplot(state_check, aes(x = reorder(state_abbr, mean_resid), y = mean_resid)) +
+  geom_point(alpha = 0.6, size = 2) +
+  geom_hline(yintercept = 0, color = "red", linetype = "dashed") +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank()
+  ) +
+  labs(
+    title = "State Heterogeneity (Baseline GAM)",
+    subtitle = "Geographic variation indicates need for random intercepts",
+    x = "State (Sorted)",
+    y = "Mean Pearson Residual"
+  )
+```
+
+```{r, warning = FALSE}
+df$season <- relevel(df$season, ref = "Summer")
+gamm_weight <- bam(
+  is_fraud ~
+    credit_score +
+    num_credit_cards +
+    num_cards_issued +
+    current_age +
+    account_age_years +
+    pin_age_years +
+    gender +
+    card_brand +
+    card_type +
+    season +
+    time_of_day +
+    s(log_amount,       k = 20) +
+    s(log_income,       k = 40) +
+    s(log_total_debt,   k = 70) +
+    s(log_time_since,   k = 30) +
+    s(log_credit_limit, k = 35) +
+    s(merchant_id, bs = "re") +
+    s(mcc,         bs = "re") +
+    s(state_abbr,  bs = "re"),
+  data      = df,
+  family    = binomial(),
+  method    = "fREML",
+  discrete  = TRUE,
+  nthreads  = 4,
+  na.action = na.exclude,
+  weights = w
+)
+p_hat_gamm <- predict(gamm_weight, type = "response")
+roc_gamm <- roc(response = df$is_fraud, predictor = p_hat_gamm, quiet = TRUE)
+auc_gamm <- auc(roc_gamm)
+
+plot(roc_gamm, main = sprintf("ROC curve (GAMM) — in-sample AUC = %.3f", auc_gamm))
+abline(0, 1, lty = 2, col = "gray50")
+
+calib_df_gamm <- tibble(
+  y     = df$is_fraud,
+  p_hat = p_hat_gamm
+) %>%
+  mutate(bin = ntile(p_hat, 10)) %>%
+  group_by(bin) %>%
+  summarise(
+    mean_p_hat = mean(p_hat),
+    obs_rate   = mean(y),
+    n          = n(),
+    .groups = "drop"
+  )
+
+ggplot(calib_df_gamm, aes(x = mean_p_hat, y = obs_rate)) +
+  geom_point() +
+  geom_line() +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  labs(
+    title = "Calibration plot (GAMM, in-sample)",
+    x = "Predicted probability (bin average)",
+    y = "Observed fraud rate"
+  ) +
+  theme_minimal()
+```
+
+### Page 33-35
+
+```{r}
+model_summary <- summary(gamm_weight)
+p_table <- as.data.frame(model_summary$p.table)
+p_table$Term <- rownames(p_table)
+
+inference_df <- p_table %>%
+  filter(Term != "(Intercept)") %>% 
+  mutate(
+    OR = exp(Estimate),
+    Lower_CI = exp(Estimate - 1.96 * `Std. Error`),
+    Upper_CI = exp(Estimate + 1.96 * `Std. Error`),
+    Significance = ifelse(`Pr(>|z|)` < 0.05, "Significant", "Not Significant")
+  ) %>%
+  arrange(desc(OR))
+
+ggplot(inference_df, 
+       aes(x = OR, y = reorder(Term, OR), color = Significance)) +
+  geom_point(size = 3) +
+  geom_errorbarh(aes(xmin = Lower_CI, xmax = Upper_CI), height = 0.2) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "gray40") +
+  scale_x_log10(                      
+    breaks = c(0.1, 0.5, 1, 2, 5, 10, 50),
+    limits = c(0.1, 50)
+  ) +
+  scale_color_manual(values = c("Significant" = "red", 
+                                "Not Significant" = "black")) +
+  labs(
+    title = "Forest Plot of Fraud Risk Factors (GAMM Odds Ratios)",
+    subtitle = "Log10 scale for odds ratios",
+    x = "Odds Ratio (log scale)",
+    y = "Predictors"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
